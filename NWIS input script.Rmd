@@ -1,0 +1,115 @@
+---
+title: "NWIS data retrieval script"
+output: html_document
+---
+
+```{r setup}
+library(tidyverse)
+library(dataRetrieval)
+
+# API code for users pulling lots of information; see more: https://doi-usgs.github.io/dataRetrieval/articles/Status.html#api-keys
+# comment out if not using, but might run into HTTP 429 Too Many Requests error - only 1000/hr
+api_key = "PUT CODE HERE" 
+API_USGS_PAT = "PUT CODE HERE"
+
+# also try running this line and adding the two above lines here
+# usethis::edit_r_environ()
+
+###USER INPUTS
+#set local directory
+setwd(dir = "SET DIRECTORY HERE")
+main_path <- getwd()
+data_output <- paste0(main_path, "/data_output")
+
+if (dir.exists(data_output)){
+} else{
+  dir.create(path = data_output)
+}
+
+sites <- read_csv("NWIS stations master with flow - edited 4-9-2025.csv", show_col_types = FALSE) %>% 
+  select(-1, -MonitoringLocationIdentifier, -MonitoringLocationName, -start_date, -end_date, -end_year, -DrainageAreaMeasure.MeasureValue, -DrainageAreaMeasure.MeasureUnitCode, -LatitudeMeasure, -LongitudeMeasure, -Park_name, -NetworkName) %>% 
+  rename(UNIT_CODE = Park) %>% 
+  unique()
+
+nps_unitcodes <- read_csv("../WQP Code/data_input/NPS_units_WSRs_ALL.csv", show_col_types = FALSE) %>% 
+  select(-1, -Linked_UNIT_CODE, -Linked_UNIT_NAME)
+
+sites <- sites %>% 
+  inner_join(nps_unitcodes)
+  
+sites$int = as.character(lapply(strsplit(as.character(sites$int), split="_"), "[", 2))
+
+sites <- sites %>% 
+  rename(monitoring_location_number = int) %>% 
+  mutate(monitoring_location_id = paste0("USGS-", monitoring_location_number),
+         monitoring_location_number = as.character(monitoring_location_number)) %>% 
+  select(monitoring_location_id, monitoring_location_number, UNIT_CODE, UNIT_NAME, NetworkCode, NetworkName)
+```
+
+```{r 1}
+site_list <- sites$monitoring_location_number %>% 
+  unique()
+
+siteINFO <- read_waterdata_monitoring_location(monitoring_location_number = site_list, agency_code = "USGS", skipGeometry = FALSE) %>% 
+  unique()
+
+siteINFO <- siteINFO %>% 
+  terra::vect() %>% 
+  tidyterra::as_tibble(geom = "xy") %>% 
+  rename("longitude" = x,
+         "latitude" = y)
+
+siteINFO <- siteINFO %>% 
+  inner_join(sites, join_by(monitoring_location_id, monitoring_location_number))
+
+site_list <- siteINFO$monitoring_location_id %>% 
+  unique()
+```
+
+```{r 2}
+parameterCd <- "00060" # Discharge in cfs
+
+group_size_discharge <- 25
+groups_discharge <- split(site_list, ceiling(seq_along(site_list) / group_size_discharge), f) 
+
+discharge <- tibble()
+
+for (group in 1:as.numeric(length(groups_discharge))){
+  group <- (as.numeric(group))
+  current_group <- groups_discharge[group] %>% 
+    unlist() %>% 
+    as.character() %>% 
+    c()
+  discharge_add <- read_waterdata_daily(monitoring_location_id = c(current_group), parameter_code = parameterCd, time = c("2000-01-01", "2030-01-01"), skipGeometry = TRUE, convertType = FALSE)
+  discharge <- plyr::rbind.fill(discharge, discharge_add)
+}
+  
+discharge <- parse_WQP(discharge) %>% 
+  distinct()
+
+rm(discharge_add, sites, groups_discharge, current_group, group, group_size_discharge, site_list, parameterCd)
+```
+
+```{r 3}
+OUTPUT_NWIS <- discharge %>% 
+  inner_join(siteINFO) %>% 
+  select(where(~!all(is.na(.x)))) %>% 
+  distinct()
+
+OUTPUT_NWIS$unit_of_measure <- "cfs"
+
+OUTPUT_NWIS <- OUTPUT_NWIS %>% 
+  rowwise() %>% 
+  mutate(qualifier = paste(qualifier, collapse = ";")) %>% 
+  ungroup() %>% 
+  mutate(qualifier = ifelse(qualifier == "", NA, qualifier))
+``` 
+
+```{r 4}
+current_datetime <- format(Sys.time(), "%d-%b-%Y-%H%M%S")
+
+# save format
+output_nwis_path <- paste0(data_output, "/OUTPUT_NWIS_", current_datetime, ".csv")
+
+write.csv(OUTPUT_NWIS, output_nwis_path)
+```
